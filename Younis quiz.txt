@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-," />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Younis Quiz</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.2/dist/confetti.browser.min.js"></script>
+  <script type="importmap">
+{
+  "imports": {
+    "react": "https://aistudiocdn.com/react@^19.1.1",
+    "react-dom/client": "https://aistudiocdn.com/react-dom@^19.1.1/client",
+    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.21.0",
+    "react/": "https://aistudiocdn.com/react@^19.1.1/"
+  }
+}
+</script>
+</head>
+  <body class="bg-slate-50 dark:bg-slate-900">
+    <div id="root"></div>
+    <script type="module">
+import React, { useState, useCallback, useEffect } from 'react';
+import ReactDOM from 'react-dom/client';
+import { GoogleGenAI, Type } from '@google/genai';
+
+// Global access to CDN scripts
+const pdfjsLib = window.pdfjsLib;
+const confetti = window.confetti;
+
+// --- From types.ts ---
+const AppStatus = {
+    IDLE: 0,
+    PROCESSING: 1,
+    QUIZ: 2,
+    RESULTS: 3,
+};
+
+// --- From services/pdfService.ts ---
+const extractTextFromPdf = async (file) => {
+    const fileReader = new FileReader();
+    return new Promise((resolve, reject) => {
+        fileReader.onload = async (event) => {
+            if (!event.target?.result) {
+                return reject(new Error('Failed to read file.'));
+            }
+            try {
+                const typedarray = new Uint8Array(event.target.result);
+                const pdf = await pdfjsLib.getDocument(typedarray).promise;
+                let fullText = '';
+                for (let i = 1; i <= pdf.numPages; i++) {
+                    const page = await pdf.getPage(i);
+                    const textContent = await page.getTextContent();
+                    const pageText = textContent.items.map((item) => item.str).join(' ');
+                    fullText += pageText + '\n\n';
+                }
+                resolve(fullText);
+            } catch (error) {
+                reject(new Error('Error parsing PDF file. It might be corrupted or protected.'));
+            }
+        };
+        fileReader.onerror = () => {
+            reject(new Error('Error reading the file.'));
+        };
+        fileReader.readAsArrayBuffer(file);
+    });
+};
+
+// --- From services/geminiService.ts ---
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+const detectLanguage = async (textSnippet) => {
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: `Detect the primary language of the following text. Respond with only the name of the language (e.g., "English", "Spanish", "French"). Text: "${textSnippet}"`,
+        });
+        return response.text.trim();
+    } catch (error) {
+        console.error("Language detection failed:", error);
+        throw new Error("Could not detect language from the provided text.");
+    }
+};
+const generateMCQs = async (text, language) => {
+    const schema = {
+        type: Type.ARRAY,
+        items: {
+            type: Type.OBJECT,
+            properties: {
+                question: { type: Type.STRING, description: "The multiple-choice question." },
+                options: { type: Type.ARRAY, items: { type: Type.STRING }, description: "An array of 4 possible answers." },
+                correctAnswer: { type: Type.STRING, description: "The correct answer, which must be one of the strings from the 'options' array." },
+            },
+            required: ["question", "options", "correctAnswer"],
+        },
+    };
+    const prompt = `Based on the following text, generate exactly 30 multiple-choice questions (MCQs).
+  
+  Instructions:
+  1. The questions must be in ${language}.
+  2. Each question must have exactly 4 options.
+  3. One of the options must be the correct answer.
+  4. Ensure the 'correctAnswer' value is an exact match to one of the values in the 'options' array.
+  5. The questions should cover a wide range of topics from the text.
+  
+  Text:
+  ---
+  ${text.substring(0, 15000)}
+  ---
+  `;
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: prompt,
+            config: {
+                responseMimeType: 'application/json',
+                responseSchema: schema,
+            },
+        });
+        const jsonString = response.text;
+        const questions = JSON.parse(jsonString);
+        if (!Array.isArray(questions)) {
+            throw new Error("AI response is not an array.");
+        }
+        return questions.filter(q => q.question && Array.isArray(q.options) && q.options.length === 4 && q.correctAnswer && q.options.includes(q.correctAnswer));
+    } catch (error) {
+        console.error("MCQ generation failed:", error);
+        throw new Error("The AI failed to generate quiz questions. The content might be too complex or not suitable for a quiz.");
+    }
+};
+
+// --- From components/Spinner.tsx ---
+const Spinner = () => {
+    return React.createElement("div", { className: "flex justify-center items-center" },
+        React.createElement("svg", { className: "animate-spin -ml-1 mr-3 h-10 w-10 text-indigo-500", xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24" },
+            React.createElement("circle", { className: "opacity-25", cx: "12", cy: "12", r: "10", stroke: "currentColor", strokeWidth: "4" }),
+            React.createElement("path", { className: "opacity-75", fill: "currentColor", d: "M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" })
+        )
+    );
+};
+
+// --- From components/Header.tsx ---
+const Header = () => {
+    return React.createElement("header", { className: "bg-white dark:bg-slate-800 shadow-md" },
+        React.createElement("div", { className: "container mx-auto px-4 py-6 text-center" },
+            React.createElement("h1", { className: "text-4xl font-bold text-slate-800 dark:text-white" }, "Younis Quiz \uD83E\uDD0D\u2603\uFE0F"),
+            React.createElement("p", { className: "text-lg text-slate-500 dark:text-slate-400 mt-1" }, "\u0628\u0627\u0644\u062A\u0648\u0641\u064A\u0642 \u0644\u0643\u0645 ... \u062F. \u064A\u0648\u0646\u0633 \u0646\u0635\u0631")
+        )
+    );
+};
+
+// --- From components/Footer.tsx ---
+const Footer = () => {
+    return React.createElement("footer", { className: "bg-white dark:bg-slate-800 shadow-inner mt-auto" },
+        React.createElement("div", { className: "container mx-auto px-4 py-4 text-center text-slate-500 dark:text-slate-400" },
+            React.createElement("p", null, `\u00A9 ${new Date().getFullYear()} Younis Quiz. Powered by AI.`)
+        )
+    );
+};
+
+// --- From components/FileUpload.tsx ---
+const FileUpload = ({ onFileUpload, error }) => {
+    const [isDragging, setIsDragging] = React.useState(false);
+    const handleFile = React.useCallback((file) => {
+        if (file && file.type === 'application/pdf') {
+            onFileUpload(file);
+        } else {
+            alert('Please upload a valid PDF file.');
+        }
+    }, [onFileUpload]);
+    const handleDragEnter = (e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(true); };
+    const handleDragLeave = (e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(false); };
+    const handleDragOver = (e) => { e.preventDefault(); e.stopPropagation(); };
+    const handleDrop = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragging(false);
+        const file = e.dataTransfer.files?.[0];
+        handleFile(file);
+    };
+    const handleFileChange = (e) => {
+        const file = e.target.files?.[0];
+        handleFile(file);
+    };
+
+    return React.createElement("div", { className: "w-full max-w-2xl mx-auto bg-white dark:bg-slate-800 rounded-lg shadow-xl p-8" },
+        React.createElement("h2", { className: "text-2xl font-bold text-center text-slate-700 dark:text-slate-200 mb-2" }, "Upload Your PDF"),
+        React.createElement("p", { className: "text-center text-slate-500 dark:text-slate-400 mb-6" }, "Drag & drop a file or click to select one to begin."),
+        error && React.createElement("div", { className: "bg-red-100 border-l-4 border-red-500 text-red-700 p-4 mb-6", role: "alert" },
+            React.createElement("p", { className: "font-bold" }, "Error"),
+            React.createElement("p", null, error)
+        ),
+        React.createElement("div", {
+                onDragEnter: handleDragEnter,
+                onDragLeave: handleDragLeave,
+                onDragOver: handleDragOver,
+                onDrop: handleDrop,
+                className: `relative border-2 border-dashed rounded-lg p-12 text-center transition-colors duration-300 ${isDragging ? 'border-indigo-500 bg-indigo-50 dark:bg-slate-700' : 'border-slate-300 dark:border-slate-600'}`
+            },
+            React.createElement("input", { type: "file", id: "file-upload", className: "absolute inset-0 w-full h-full opacity-0 cursor-pointer", onChange: handleFileChange, accept: ".pdf" }),
+            React.createElement("label", { htmlFor: "file-upload", className: "flex flex-col items-center justify-center space-y-4" },
+                React.createElement("svg", { className: "w-16 h-16 text-slate-400", fill: "none", stroke: "currentColor", viewBox: "0 0 24 24", xmlns: "http://www.w3.org/2000/svg" },
+                    React.createElement("path", { strokeLinecap: "round", strokeLinejoin: "round", strokeWidth: "2", d: "M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" })
+                ),
+                React.createElement("p", { className: "text-slate-500 dark:text-slate-400" },
+                    React.createElement("span", { className: "font-semibold text-indigo-600 dark:text-indigo-400" }, "Click to upload"), " or drag and drop"
+                ),
+                React.createElement("p", { className: "text-xs text-slate-400" }, "PDF files only")
+            )
+        )
+    );
+};
+
+// --- From components/Quiz.tsx ---
+const Quiz = ({ questions, onSubmit }) => {
+    const [answers, setAnswers] = React.useState({});
+    const handleAnswerChange = (questionIndex, answer) => {
+        setAnswers({ ...answers, [questionIndex]: answer });
+    };
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        if (Object.keys(answers).length !== questions.length) {
+            alert('Please answer all questions before submitting.');
+            return;
+        }
+        onSubmit(answers);
+    };
+
+    return React.createElement("div", { className: "bg-white dark:bg-slate-800 rounded-lg shadow-xl p-8" },
+        React.createElement("h2", { className: "text-3xl font-bold text-center text-slate-800 dark:text-white mb-6" }, "Quiz Time!"),
+        React.createElement("form", { onSubmit: handleSubmit },
+            questions.map((q, index) =>
+                React.createElement("div", { key: index, className: "mb-8 border-b border-slate-200 dark:border-slate-700 pb-6" },
+                    React.createElement("p", { className: "font-semibold text-lg mb-4 text-slate-700 dark:text-slate-300" }, `${index + 1}. ${q.question}`),
+                    React.createElement("div", { className: "space-y-3" },
+                        q.options.map((option, optionIndex) =>
+                            React.createElement("label", { key: optionIndex, className: "flex items-center p-3 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer transition-colors" },
+                                React.createElement("input", {
+                                    type: "radio",
+                                    name: `question-${index}`,
+                                    value: option,
+                                    checked: answers[index] === option,
+                                    onChange: () => handleAnswerChange(index, option),
+                                    className: "h-5 w-5 text-indigo-600 border-slate-300 focus:ring-indigo-500"
+                                }),
+                                React.createElement("span", { className: "ml-3 text-slate-600 dark:text-slate-400" }, option)
+                            )
+                        )
+                    )
+                )
+            ),
+            React.createElement("div", { className: "text-center mt-8" },
+                React.createElement("button", { type: "submit", className: "px-8 py-3 bg-indigo-600 text-white font-bold rounded-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-transform transform hover:scale-105" },
+                    "Submit Quiz"
+                )
+            )
+        )
+    );
+};
+
+// --- From components/Results.tsx ---
+const Results = ({ questions, score, passed, onRestart }) => {
+    React.useEffect(() => {
+        if (passed && typeof confetti === 'function') {
+            confetti({ particleCount: 200, spread: 90, origin: { y: 0.6 }, angle: 90, startVelocity: 50, ticks: 300, gravity: 1.2 });
+        }
+    }, [passed]);
+    const getOptionLetter = (option, question) => {
+        const index = question.options.indexOf(option);
+        if (index === -1) return '?';
+        return String.fromCharCode(65 + index);
+    };
+
+    return React.createElement("div", { className: "bg-white dark:bg-slate-800 rounded-lg shadow-xl p-8 text-center max-w-2xl mx-auto" },
+        passed ?
+        React.createElement("div", { className: "mb-6" },
+            React.createElement("h2", { className: "text-4xl font-bold text-green-500 mb-2" }, "Congratulations! You passed \uD83C\uDF89")
+        ) :
+        React.createElement("div", { className: "mb-6" },
+            React.createElement("h2", { className: "text-4xl font-bold text-red-500 mb-2" }, "Try again! You did not pass.")
+        ),
+        React.createElement("p", { className: "text-xl text-slate-600 dark:text-slate-300 mb-8" }, `Your score: ${score} / ${questions.length}`),
+        React.createElement("div", { className: "text-left mx-auto max-w-md bg-slate-100 dark:bg-slate-700 p-6 rounded-lg mb-8" },
+            React.createElement("h3", { className: "text-xl font-bold text-slate-800 dark:text-white mb-4 text-center" }, "Correct Answers"),
+            React.createElement("div", { className: "grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-x-8 gap-y-2" },
+                questions.map((q, index) =>
+                    React.createElement("p", { key: index, className: "font-mono text-slate-700 dark:text-slate-300 text-lg" },
+                        React.createElement("span", { className: "font-semibold" }, `${index + 1}:`), ` ${getOptionLetter(q.correctAnswer, q)}`
+                    )
+                )
+            )
+        ),
+        React.createElement("button", { onClick: onRestart, className: "px-8 py-3 bg-indigo-600 text-white font-bold rounded-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-transform transform hover:scale-105" },
+            "Create Another Quiz"
+        )
+    );
+};
+
+// --- From App.tsx ---
+const App = () => {
+    const [status, setStatus] = React.useState(AppStatus.IDLE);
+    const [processingMessage, setProcessingMessage] = React.useState('');
+    const [questions, setQuestions] = React.useState([]);
+    const [userAnswers, setUserAnswers] = React.useState({});
+    const [score, setScore] = React.useState(0);
+    const [passed, setPassed] = React.useState(false);
+    const [error, setError] = React.useState(null);
+
+    const handleFileProcess = React.useCallback(async (file) => {
+        setStatus(AppStatus.PROCESSING);
+        setError(null);
+        try {
+            setProcessingMessage('Extracting text from PDF...');
+            const text = await extractTextFromPdf(file);
+            if (!text || text.trim().length < 100) {
+                throw new Error('Could not extract sufficient text from the PDF. Please try a different file.');
+            }
+            setProcessingMessage('Detecting language...');
+            const language = await detectLanguage(text.substring(0, 1000));
+            setProcessingMessage(`Language detected: ${language}. Generating quiz questions... This may take a moment.`);
+            const generatedQuestions = await generateMCQs(text, language);
+            if (generatedQuestions.length === 0) {
+                throw new Error('The AI failed to generate questions. The PDF content might not be suitable for a quiz.');
+            }
+            setQuestions(generatedQuestions);
+            setUserAnswers({});
+            setStatus(AppStatus.QUIZ);
+        } catch (err) {
+            console.error(err);
+            setError(err instanceof Error ? err.message : 'An unknown error occurred.');
+            setStatus(AppStatus.IDLE);
+        } finally {
+            setProcessingMessage('');
+        }
+    }, []);
+
+    const handleQuizSubmit = (answers) => {
+        setUserAnswers(answers);
+        let correctAnswers = 0;
+        questions.forEach((q, index) => {
+            if (answers[index] === q.correctAnswer) {
+                correctAnswers++;
+            }
+        });
+        setScore(correctAnswers);
+        const passThreshold = questions.length / 2;
+        setPassed(correctAnswers >= passThreshold);
+        setStatus(AppStatus.RESULTS);
+    };
+
+    const handleRestart = () => {
+        setStatus(AppStatus.IDLE);
+        setQuestions([]);
+        setUserAnswers({});
+        setScore(0);
+        setPassed(false);
+        setError(null);
+    };
+
+    const renderContent = () => {
+        switch (status) {
+            case AppStatus.PROCESSING:
+                return React.createElement("div", { className: "text-center p-8" },
+                    React.createElement(Spinner),
+                    React.createElement("p", { className: "mt-4 text-lg text-slate-600 dark:text-slate-300" }, processingMessage)
+                );
+            case AppStatus.QUIZ:
+                return React.createElement(Quiz, { questions: questions, onSubmit: handleQuizSubmit });
+            case AppStatus.RESULTS:
+                return React.createElement(Results, { questions: questions, score: score, passed: passed, onRestart: handleRestart });
+            case AppStatus.IDLE:
+            default:
+                return React.createElement(FileUpload, { onFileUpload: handleFileProcess, error: error });
+        }
+    };
+
+    return React.createElement("div", { className: "flex flex-col min-h-screen font-sans text-slate-800 dark:text-slate-200" },
+        React.createElement(Header),
+        React.createElement("main", { className: "flex-grow container mx-auto px-4 py-8 flex items-center justify-center" },
+            React.createElement("div", { className: "w-full max-w-4xl" },
+                renderContent()
+            )
+        ),
+        React.createElement(Footer)
+    );
+};
+
+// --- Render App ---
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+    </script>
+  </body>
+</html>
